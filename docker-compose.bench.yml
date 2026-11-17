@@ -6,7 +6,8 @@
 #   docker compose -f docker-compose.bench.yml up --build -d   # 后台
 #   docker compose -f docker-compose.bench.yml logs -f
 #   docker compose -f docker-compose.bench.yml down            # 停止(加 -v 连数据卷一起删)
-# 浏览器：http://localhost:8787（用 ADMIN_PASSWORD 登录）
+# 浏览器：http://localhost:8787（用你自己设置的管理员密码登录，不要使用示例口令）
+# 这个文件使用 network_mode: host，只适合本机测评。不要把它用于生产，也不要把它当成加固后的默认部署。
 
 services:
   pojun-bench:
