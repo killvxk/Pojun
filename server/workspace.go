@@ -68,6 +68,20 @@ func (s *Server) wsProtected(abs string) bool {
 	return false
 }
 
+// wsDeniesRead 拒绝通过文件管理器读取流量代理的 CA 私钥目录。
+// 解析符号链接后的真实路径落在 data/traffic/_ca 内即拒绝。无法解析时拒绝。
+func (s *Server) wsDeniesRead(abs string) bool {
+	baseReal := filepath.Clean(s.m.dir)
+	if resolved, err := filepath.EvalSymlinks(baseReal); err == nil {
+		baseReal = filepath.Clean(resolved)
+	}
+	real, ok := evalExistingPath(abs)
+	if !ok {
+		return true
+	}
+	return pathWithin(filepath.Join(baseReal, "traffic", "_ca"), real)
+}
+
 // evalExistingPath resolves abs to its real path. The target itself may not
 // exist yet (write/mkdir/upload): resolve the nearest existing ancestor and
 // re-append the remaining suffix, so a symlinked parent still resolves to the
@@ -180,6 +194,10 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "不是目录")
 		return
 	}
+	if s.wsDeniesRead(abs) {
+		writeErr(w, 403, "该目录包含本地信任材料，文件管理器不可列出")
+		return
+	}
 	ents, err := os.ReadDir(abs)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -189,6 +207,10 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 	for _, e := range ents {
 		info, err := e.Info()
 		if err != nil {
+			continue
+		}
+		child := filepath.Join(abs, e.Name())
+		if s.wsDeniesRead(child) {
 			continue
 		}
 		out = append(out, wsEntry{
@@ -215,6 +237,10 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
+		return
+	}
+	if s.wsDeniesRead(abs) {
+		writeErr(w, 403, "该文件是本地信任材料，文件管理器不可读取")
 		return
 	}
 	fi, err := os.Stat(abs)
@@ -334,6 +360,10 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
+		return
+	}
+	if s.wsDeniesRead(abs) {
+		writeErr(w, 403, "该文件是本地信任材料，文件管理器不可下载")
 		return
 	}
 	fi, err := os.Stat(abs)

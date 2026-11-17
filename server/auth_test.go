@@ -136,14 +136,36 @@ func TestLoginLimiterSuccessResetsWindow(t *testing.T) {
 	}
 }
 
-// 全局兜底：每 IP 各失败 1 次、凑满全局阈值 → 全局锁定（含全新 IP）。
+// 未配置可信反代时，伪造的 X-Forwarded-For / X-Real-IP 不得改写限流键。
+func TestClientIPIgnoresSpoofedForwardedForByDefault(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	r.RemoteAddr = "203.0.113.8:1234"
+	r.Header.Set("X-Forwarded-For", "198.51.100.9, 203.0.113.8")
+	r.Header.Set("X-Real-IP", "198.51.100.10")
+	if got := clientIP(r); got != "203.0.113.8" {
+		t.Fatalf("clientIP=%q, want 203.0.113.8 when no trusted proxy is configured", got)
+	}
+}
+
+// 大量来源的失败不得把另一个从未失败的地址锁死。
+func TestLoginLimiterGlobalFloodDoesNotLockOtherIP(t *testing.T) {
+	l := &loginLimiter{fails: map[string][]time.Time{}, lockedUntil: map[string]time.Time{}}
+	for i := 0; i < 40; i++ {
+		l.recordFail(fmt.Sprintf("10.1.0.%d", i))
+	}
+	if ok, _ := l.allow("192.0.2.10"); !ok {
+		t.Fatal("全局失败计数不应锁死未失败的地址")
+	}
+}
+
+// 旧的全员锁已移除：大量不同地址失败后，全新地址仍可尝试登录。
 func TestLoginLimiterGlobalBackstop(t *testing.T) {
 	l := &loginLimiter{fails: map[string][]time.Time{}, lockedUntil: map[string]time.Time{}}
-	for i := 0; i < loginGlobalMaxFails; i++ {
+	for i := 0; i < 40; i++ {
 		l.recordFail(fmt.Sprintf("10.0.0.%d", i))
 	}
-	if ok, _ := l.allow("10.9.9.9"); ok {
-		t.Fatal("达到全局失败阈值后，全新 IP 也应被全局锁定兜住")
+	if ok, _ := l.allow("10.9.9.9"); !ok {
+		t.Fatal("全新 IP 不应再被全员锁锁死")
 	}
 }
 

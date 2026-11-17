@@ -25,7 +25,7 @@ RUN_USER="pojun"
 VERSION="latest"
 MODE="${MODE:-}"
 WITH_TOOLS=0
-LISTEN_ADDR="${LISTEN_ADDR:-:8787}"
+LISTEN_ADDR="${LISTEN_ADDR:-127.0.0.1:8787}"
 PROXY_ADDR="${PROXY_ADDR:-127.0.0.1:8788}"
 PG_SUPER="${PG_SUPER:-postgres}"
 # 安装期出网代理（apt / curl / go 下载走它）。留空 = 直连。
@@ -597,6 +597,8 @@ User=${RUN_USER}
 WorkingDirectory=${INSTALL_DIR}
 Environment=HOME=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/start.sh -addr ${LISTEN_ADDR} -proxy ${PROXY_ADDR}
+# 把主进程 pid 写到 root 拥有的目录，供 hostd 核验。服务用户不能改这个文件。
+ExecStartPost=+/bin/sh -c 'mkdir -p /run/pojun-hostd && echo \$MAINPID > /run/pojun-hostd/pojun.pid && chown root:root /run/pojun-hostd /run/pojun-hostd/pojun.pid && chmod 755 /run/pojun-hostd && chmod 644 /run/pojun-hostd/pojun.pid'
 # 装机代理：宿主环境页的「一键安装」和后台情报同步用。hostd 是独立进程，
 # 不共享主服务环境，所以它自己的单元也要带（见下方 hostd 单元）。
 ${INSTALL_PROXY_ENV}
@@ -666,8 +668,15 @@ deploy_binary_darwin(){
   # Homebrew：没有就装（官方安装器，需要交互确认一次密码给 /usr/local 写权限的
   # Intel 机器；Apple Silicon 装到 /opt/homebrew 不需要密码）
   if ! command -v brew >/dev/null 2>&1; then
-    warn "未检测到 Homebrew，先安装它（可能要求输入密码/回车确认）..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"       || die "Homebrew 安装失败；也可手动安装后重跑本脚本"
+    if [ -z "${HOMEBREW_INSTALL_SHA256:-}" ]; then
+      die "未检测到 Homebrew，且未提供 HOMEBREW_INSTALL_SHA256。拒绝执行官方安装脚本的 curl|bash。请自行安装 brew 后重跑。"
+    fi
+    warn "按 HOMEBREW_INSTALL_SHA256 校验后再执行 Homebrew 安装脚本..."
+    local brew_setup
+    brew_setup="$(mktemp)"
+    curl -fsSL -o "$brew_setup" https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh || die "下载 Homebrew 安装脚本失败"
+    echo "${HOMEBREW_INSTALL_SHA256}  ${brew_setup}" | shasum -a 256 -c - || die "Homebrew 安装脚本摘要不符，已拒绝执行"
+    /bin/bash "$brew_setup" || die "Homebrew 安装失败"
     eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || true)"
     eval "$(/usr/local/bin/brew shellenv 2>/dev/null || true)"
   fi
@@ -857,7 +866,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/pojun-hostd -socket /run/pojun/hostd.sock -socket-group ${RUN_USER}
+ExecStart=/usr/local/bin/pojun-hostd -socket /run/pojun/hostd.sock -socket-group ${RUN_USER} -allow-exe ${INSTALL_DIR}/pojun -allow-pid-file /run/pojun-hostd/pojun.pid
 ${INSTALL_PROXY_ENV}
 Restart=always
 RestartSec=5

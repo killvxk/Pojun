@@ -13,12 +13,13 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -145,6 +146,20 @@ type relayTunnels struct {
 
 var relayTunnelMgr = &relayTunnels{byName: map[string]*exec.Cmd{}, cancels: map[string]context.CancelFunc{}}
 
+var sshUserHostRe = regexp.MustCompile(`^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$`)
+
+// validateSSHTarget 拒绝会被 ssh 当成选项的 user@host，端口只接受数字。
+func validateSSHTarget(userHost, port string) error {
+	if !sshUserHostRe.MatchString(userHost) {
+		return fmt.Errorf("ssh 目标必须是 user@host，且不能包含选项")
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("ssh 端口非法")
+	}
+	return nil
+}
+
 // startRelayTunnel 为监听器建 SSH 反向隧道：中转 :port → 本机 127.0.0.1:port。
 // ExitOnForwardFailure + ServerAlive 保活；进程退出由 goroutine 指数退避重连，
 // 直到监听器停止（ctx 取消）。
@@ -157,7 +172,13 @@ func (s *Server) startRelayTunnel(name string, port int) error {
 	if i := strings.LastIndex(cfg.SSH, ":"); i > 0 {
 		userHost, sshPort = cfg.SSH[:i], cfg.SSH[i+1:]
 	}
+	if err := validateSSHTarget(userHost, sshPort); err != nil {
+		return err
+	}
 	key, pass := strings.TrimSpace(cfg.Key), strings.TrimSpace(cfg.Pass)
+	if strings.HasPrefix(key, "-") {
+		return fmt.Errorf("ssh 私钥路径不能以 - 开头")
+	}
 	// 每次重连都重建 Cmd：exec.Cmd 用过之后不可复用（也不能按值拷贝）。
 	build := func() *exec.Cmd {
 		args := []string{
@@ -172,15 +193,15 @@ func (s *Server) startRelayTunnel(name string, port int) error {
 		var cmd *exec.Cmd
 		switch {
 		case key != "":
-			args = append(args, "-i", key, "-o", "BatchMode=yes", userHost)
+			args = append(args, "-i", key, "-o", "BatchMode=yes", "--", userHost)
 			cmd = exec.Command("ssh", args...)
 		case pass != "":
 			// 密码认证走 sshpass（Kali/Ubuntu 可 apt install sshpass）。
-			args = append(args, userHost)
+			args = append(args, "--", userHost)
 			cmd = exec.Command("sshpass", append([]string{"-e"}, args...)...)
 			cmd.Env = append(cmd.Environ(), "SSHPASS="+pass)
 		default:
-			args = append(args, userHost)
+			args = append(args, "--", userHost)
 			cmd = exec.Command("ssh", args...)
 		}
 		cmd.WaitDelay = time.Second
@@ -257,11 +278,11 @@ func stopRelayTunnel(name string) {
 func (s *Server) c2ConfigGet(w http.ResponseWriter, r *http.Request) {
 	cfg := s.c2RelayConfig()
 	writeJSON(w, 200, map[string]any{
-		"mode":   cfg.Mode,
-		"host":   cfg.Host,
-		"ssh":    cfg.SSH,
-		"key":    cfg.Key,
-		"iface":  cfg.Iface,
+		"mode":     cfg.Mode,
+		"host":     cfg.Host,
+		"ssh":      cfg.SSH,
+		"key":      cfg.Key,
+		"iface":    cfg.Iface,
 		"has_pass": cfg.Pass != "",
 	})
 }
@@ -277,7 +298,7 @@ func (s *Server) c2ConfigPut(w http.ResponseWriter, r *http.Request) {
 		Key   *string `json:"key"`
 		Iface *string `json:"iface"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -316,4 +337,3 @@ func (s *Server) c2ConfigPut(w http.ResponseWriter, r *http.Request) {
 	}
 	s.c2ConfigGet(w, r)
 }
-

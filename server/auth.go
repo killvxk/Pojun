@@ -2,6 +2,8 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
@@ -21,8 +23,9 @@ import (
 const (
 	jwtKeyFilename = "jwt.key"
 	authPassKey    = "auth.password_hash"
-	jwtTTL         = 7 * 24 * time.Hour
-	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	// 会话缩短到 24 小时。改密码仍会轮换签名 key，使已发出的 token 立即失效。
+	jwtTTL   = 24 * time.Hour
+	keyChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
 	// 绕过。上限是 bcrypt 的硬限制：超过 72 字节 GenerateFromPassword 会返回
@@ -113,19 +116,27 @@ func (s *Server) rotateJWTKey() error {
 	return nil
 }
 
-// clientIP 提取客户端 IP：反代部署下取 X-Forwarded-For 首段（部署手册要求
-// 反代覆写该头），直连时取 RemoteAddr。XFF 可伪造，所以限流器另有全局限
-// 作为兜底——伪造无限个 IP 也撞不穿全局阈值。
+// clientIP 取连接对端地址。只有当对端属于 POJUN_TRUSTED_PROXIES（IP 或 CIDR，
+// 逗号分隔）时，才读取反代写入的 X-Real-IP / X-Forwarded-For。未配置时忽略
+// 这两个头，避免伪造来源绕过每 IP 限流。
 func clientIP(r *http.Request) string {
+	host := remoteHost(r)
+	if !trustedProxy(host) {
+		return host
+	}
+	if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+		return xr
+	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.Index(xff, ","); i > 0 {
+		if i := strings.IndexByte(xff, ','); i > 0 {
 			return strings.TrimSpace(xff[:i])
 		}
 		return strings.TrimSpace(xff)
 	}
-	if xr := r.Header.Get("X-Real-IP"); xr != "" {
-		return strings.TrimSpace(xr)
-	}
+	return host
+}
+
+func remoteHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -133,18 +144,37 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+func trustedProxy(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, part := range strings.Split(os.Getenv("POJUN_TRUSTED_PROXIES"), ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if parsed := net.ParseIP(part); parsed != nil && parsed.Equal(ip) {
+			return true
+		}
+		if _, network, err := net.ParseCIDR(part); err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // loginLimiter 是登录/初始化接口的进程级防爆破闸门：
-//   - 每 IP：10 分钟窗口内失败 5 次 → 锁 15 分钟；
-//   - 全局：1 分钟窗口内失败 30 次 → 全局锁 5 分钟（兜 XFF 伪造与分布式低速）。
+// 每 IP 在 10 分钟窗口内失败 5 次 → 锁该 IP 15 分钟。
 //
+// 不再使用「全局失败次数锁死所有地址」。那个全员锁可以被伪造来源或分布式
+// 失败把管理员自己的登录一起锁住。来源伪造改由「默认不信任转发头」挡住。
 // 内存态即可：重启清零只影响攻击者的等待时间，不影响正确性。
 // 返回 (允许, 剩余锁定时长)。
 type loginLimiter struct {
 	mu          sync.Mutex
 	fails       map[string][]time.Time // ip → 失败时间序列（滑动窗口）
 	lockedUntil map[string]time.Time   // ip → 锁定截止
-	globalFails []time.Time
-	globalUntil time.Time
 }
 
 var loginLimit = &loginLimiter{fails: map[string][]time.Time{}, lockedUntil: map[string]time.Time{}}
@@ -153,9 +183,6 @@ const (
 	loginMaxFailsPerIP   = 5
 	loginFailWindow      = 10 * time.Minute
 	loginLockoutPerIP    = 15 * time.Minute
-	loginGlobalMaxFails  = 30
-	loginGlobalWindow    = time.Minute
-	loginGlobalLockout   = 5 * time.Minute
 	loginFailureMinDelay = 300 * time.Millisecond // 失败响应的人为下限，抹平时序差
 )
 
@@ -165,9 +192,6 @@ func (l *loginLimiter) allow(ip string) (bool, time.Duration) {
 	defer l.mu.Unlock()
 	if until, ok := l.lockedUntil[ip]; ok && now.Before(until) {
 		return false, until.Sub(now)
-	}
-	if now.Before(l.globalUntil) {
-		return false, l.globalUntil.Sub(now)
 	}
 	// 惰性清理过期窗口，防 map 随扫描流量无限增长。
 	for k, until := range l.lockedUntil {
@@ -195,18 +219,6 @@ func (l *loginLimiter) recordFail(ip string) {
 		l.lockedUntil[ip] = now.Add(loginLockoutPerIP)
 		l.fails[ip] = nil
 	}
-	// 全局滑动窗口。
-	l.globalFails = append(l.globalFails, now)
-	gcut := now.Add(-loginGlobalWindow)
-	j := 0
-	for j < len(l.globalFails) && l.globalFails[j].Before(gcut) {
-		j++
-	}
-	l.globalFails = l.globalFails[j:]
-	if len(l.globalFails) >= loginGlobalMaxFails {
-		l.globalUntil = now.Add(loginGlobalLockout)
-		l.globalFails = nil
-	}
 }
 
 func (l *loginLimiter) recordSuccess(ip string) {
@@ -233,7 +245,7 @@ func loginGuard(w http.ResponseWriter, r *http.Request, action string) bool {
 	return true
 }
 
-// signJWT issues a 7-day HS256 token for user POJUN.
+// signJWT issues an HS256 token for user POJUN. Lifetime is jwtTTL.
 func signJWT(key []byte) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
 		Subject:   "POJUN",
@@ -331,7 +343,80 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
 }
 
-// POST /api/auth/init — sets the password for the first time; rejected if already set.
+// prepareInitToken 在进程启动时调用。已经有管理员密码则不生成口令，避免
+// 任何路径把已初始化实例重新打开。数据库暂时读失败时也不生成。
+func (s *Server) prepareInitToken() {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return
+	}
+	hash, _, err := s.m.pg.GetSetting(authPassKey)
+	if err != nil || hash != "" {
+		return
+	}
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+	if s.initToken == "" {
+		s.mintInitTokenLocked()
+	}
+}
+
+// mintInitTokenLocked 生成一次性初始化口令。POJUN_INIT_TOKEN 若已设置则采用
+// 它且不把值写进日志；否则生成随机值并打印一次，供操作员抄到初始化页面。
+// 同 UID 进程可以读到日志，这不能挡住本机同用户。它挡住的是还没拿到口令的
+// 网络访问者。调用方必须持有 initMu。
+func (s *Server) mintInitTokenLocked() {
+	if v := strings.TrimSpace(os.Getenv("POJUN_INIT_TOKEN")); v != "" {
+		s.initToken = v
+		log.Printf("[auth] 实例尚未初始化：使用环境变量 POJUN_INIT_TOKEN（值不打印）。成功设置密码后该口令作废")
+		return
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		log.Printf("[auth] 无法生成初始化口令，拒绝开放 /api/auth/init: %v", err)
+		s.initToken = ""
+		return
+	}
+	s.initToken = hex.EncodeToString(buf)
+	log.Printf("[auth] 首次初始化口令（仅本次进程有效，成功后作废）: %s", s.initToken)
+	log.Printf("[auth] 同用户可以阅读上述日志。这不是对本机同 UID 进程的隔离，只用于挡住未持有口令的网络访问者")
+}
+
+func initTokenEqual(got, want string) bool {
+	if got == "" || want == "" || len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func sessionCookieSecure() bool { return os.Getenv("POJUN_COOKIE_SECURE") == "1" }
+
+func (s *Server) setSessionCookies(w http.ResponseWriter, token string) {
+	secure := sessionCookieSecure()
+	maxAge := int(jwtTTL.Seconds())
+	http.SetCookie(w, &http.Cookie{
+		Name: "pojun_token", Value: token, Path: "/", MaxAge: maxAge,
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: secure,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name: "pojun_session", Value: "1", Path: "/", MaxAge: maxAge,
+		HttpOnly: false, SameSite: http.SameSiteStrictMode, Secure: secure,
+	})
+}
+
+func clearSessionCookies(w http.ResponseWriter) {
+	secure := sessionCookieSecure()
+	http.SetCookie(w, &http.Cookie{
+		Name: "pojun_token", Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: secure,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name: "pojun_session", Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: false, SameSite: http.SameSiteStrictMode, Secure: secure,
+	})
+}
+
+// POST /api/auth/init — 仅在尚未设置密码时生效，并且必须出示一次性初始化口令。
+// 已有密码时保持 403，不改哈希、不轮换口令。并发下只有一次 INSERT 能成功。
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	if !loginGuard(w, r, "init") {
 		return
@@ -340,6 +425,22 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
+	var req struct {
+		Password  string `json:"password"`
+		InitToken string `json:"init_token"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	if header := strings.TrimSpace(r.Header.Get("X-Pojun-Init-Token")); header != "" {
+		req.InitToken = header
+	}
+	req.InitToken = strings.TrimSpace(req.InitToken)
+
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+
 	existing, _, err := pg.GetSetting(authPassKey)
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
@@ -349,10 +450,14 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	var req struct {
-		Password string `json:"password"`
+	if s.initToken == "" {
+		s.mintInitTokenLocked()
 	}
-	if err := decode(r, &req); err != nil || req.Password == "" {
+	if !initTokenEqual(req.InitToken, s.initToken) {
+		writeErr(w, 403, "初始化口令无效")
+		return
+	}
+	if req.Password == "" {
 		writeErr(w, 400, "密码不能为空")
 		return
 	}
@@ -365,9 +470,8 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "密码加密失败")
 		return
 	}
-	// 用 INSERT ... ON CONFLICT DO NOTHING 而不是 upsert：上面那次 GetSetting 只是
-	// 快速失败路径，真正"仅首次可设"的保证落在主键约束上。bcrypt 要跑几十毫秒，
-	// 这期间别的请求完全可能先把密码设好，而读检查本身也可能因故障而失效。
+	// INSERT ... ON CONFLICT DO NOTHING：bcrypt 期间别的请求可能已经写入。
+	// 锁保证本进程内只有一个请求走到这里；数据库约束挡住多进程。
 	inserted, err := pg.InsertSettingIfAbsent(authPassKey, string(hash))
 	if err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
@@ -377,12 +481,20 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
+	s.initToken = ""
 	tok, err := signJWT(s.currentJWTKey())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
+	s.setSessionCookies(w, tok)
 	writeJSON(w, 200, map[string]any{"token": tok})
+}
+
+// POST /api/auth/logout — 清掉会话 cookie。不要求当前 token 仍然有效。
+func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
+	clearSessionCookies(w)
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // POST /api/auth/change-password — changes the admin password. Requires a valid
@@ -441,6 +553,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		// 密码已改成功、轮换失败：不回滚（密码改了比没改安全），但要显式告警。
 		log.Printf("[auth] 改密码后 JWT key 轮换失败: %v（旧 token 仍然有效，请重启服务强制轮换）", err)
 	}
+	clearSessionCookies(w)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -485,5 +598,6 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
+	s.setSessionCookies(w, tok)
 	writeJSON(w, 200, map[string]any{"token": tok})
 }

@@ -58,6 +58,21 @@ func TestScalarStr(t *testing.T) {
 	}
 }
 
+func TestRejectUnknownTemplateParams(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"a": map[string]any{"type": "string"},
+		},
+	}
+	if err := rejectUnknownParams(schema, map[string]any{"a": "ok", "b": "extra"}); err == nil {
+		t.Fatal("schema 之外的参数应被拒绝")
+	}
+	if err := rejectUnknownParams(schema, map[string]any{"a": "ok"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEnsureSchema(t *testing.T) {
 	// empty → thin {args:string}
 	m := ensureSchema(nil)
@@ -77,6 +92,20 @@ func TestEnsureSchema(t *testing.T) {
 func TestShellQuote(t *testing.T) {
 	if got := shellQuote("a'b"); got != `'a'\''b'` {
 		t.Fatalf("shellQuote(a'b) = %q", got)
+	}
+}
+
+// 值里的占位符不得在后续轮次被再次展开。多轮 ReplaceAll 会把已经加过引号的
+// 参数值重新打开，使另一个参数变成未加引号的 shell 片段。
+func TestRenderTemplateDoesNotRescanInsertedValues(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		got := renderTemplate("echo {a}", map[string]any{
+			"a": "x{b}",
+			"b": "$(echo INJECTED)",
+		}, shellQuote)
+		if got != "echo 'x{b}'" {
+			t.Fatalf("iter %d: nested placeholder re-expanded: %q", i, got)
+		}
 	}
 }
 

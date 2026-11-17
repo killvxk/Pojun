@@ -38,6 +38,8 @@ func main() {
 		socketPath  = flag.String("socket", "/run/pojun/hostd.sock", "Unix socket 路径")
 		socketMode  = flag.String("socket-mode", "0660", "socket 权限(八进制)")
 		socketGroup = flag.String("socket-group", "", "socket 属组(留空=不改,通常填主服务的运行用户)")
+		allowExe    = flag.String("allow-exe", "", "允许连接的 pojun 主程序绝对路径；服务模式下必填")
+		allowPID    = flag.String("allow-pid-file", "", "可选：root 拥有的主进程 pid 文件。未设置时只核验可执行文件路径")
 		check       = flag.Bool("check", false, "自检后退出(不启动服务)")
 		installAll  = flag.Bool("install-all", false, "安装 catalog 中所有缺失工具后退出")
 		showVer     = flag.Bool("version", false, "打印版本后退出")
@@ -66,13 +68,23 @@ func main() {
 		return
 	}
 
+	if strings.TrimSpace(*allowExe) == "" {
+		log.Fatalf("[hostd] 服务模式必须指定 -allow-exe（pojun 主程序绝对路径）。同 UID 的其他进程不能仅靠读 token 获得授权")
+	}
 	mode := parseMode(*socketMode)
 	ln, err := hostd.Listen(*socketPath, mode, *socketGroup)
 	if err != nil {
 		log.Fatalf("[hostd] 监听 %s 失败: %v", *socketPath, err)
 	}
-	log.Printf("[hostd] v%s 就绪 socket=%s mode=%s group=%q pkg_mgr=%s tools=%d",
-		version, *socketPath, *socketMode, *socketGroup, mgr, len(hosttools.Inventory()))
+	log.Printf("[hostd] v%s 就绪 socket=%s mode=%s group=%q allow_exe=%s pid_file=%s pkg_mgr=%s tools=%d",
+		version, *socketPath, *socketMode, *socketGroup, *allowExe, *allowPID, mgr, len(hosttools.Inventory()))
+	log.Printf("[hostd] 对端核验只认可执行文件路径%s。直接执行该二进制，或在内核允许时 ptrace 主进程，仍然可能驱动安装；不要把这说成同 UID 隔离已完成",
+		func() string {
+			if strings.TrimSpace(*allowPID) == "" {
+				return "（未设置 root pid 文件）"
+			}
+			return " 加 root pid 文件"
+		}())
 
 	// 任务的父 ctx = 进程生命周期：收到 SIGTERM 时连正在跑的安装一起取消。
 	// 绝不能传 HTTP 请求的 ctx——handler 返回即取消，排队任务会当场变 cancelled。
@@ -81,6 +93,10 @@ func main() {
 
 	hs := hostd.NewServer(ctx, log.New(os.Stderr, "", log.LstdFlags))
 	hs.Version = version
+	hs.RequirePeer = true
+	hs.AllowedExe = *allowExe
+	hs.AllowedPIDFile = *allowPID
+	hs.Proxy = configuredInstallProxy()
 	// 自身路径用于「自我换装」：改了名/软链也认得出真实文件。
 	if exe, runErr := os.Executable(); runErr == nil {
 		if resolved, e := filepath.EvalSymlinks(exe); e == nil {
@@ -92,6 +108,9 @@ func main() {
 	srv := &http.Server{
 		Handler:           hs.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return hostd.WithPeerConn(ctx, c)
+		},
 	}
 
 	go func() {
@@ -114,13 +133,8 @@ func runInstallAll(mgr hostd.PkgMgr) {
 	defer stop()
 	hs := hostd.NewServer(ctx, log.New(os.Stderr, "", log.LstdFlags))
 	hs.Version = version
-	proxy := firstNonEmpty(os.Getenv("HTTPS_PROXY"), os.Getenv("https_proxy"), os.Getenv("HTTP_PROXY"), os.Getenv("http_proxy"))
-	if v, err := hostd.ValidateProxy(proxy); err == nil {
-		proxy = v
-	} else {
-		log.Printf("[hostd] 忽略非法代理: %v", err)
-		proxy = ""
-	}
+	proxy := configuredInstallProxy()
+	hs.Proxy = proxy
 	missing := 0
 	failed := 0
 	for _, tool := range hosttools.Inventory() {
@@ -154,6 +168,19 @@ func runInstallAll(mgr hostd.PkgMgr) {
 	if failed > 0 {
 		os.Exit(1)
 	}
+}
+
+func configuredInstallProxy() string {
+	raw := firstNonEmpty(os.Getenv("POJUN_INSTALL_PROXY"), os.Getenv("HTTPS_PROXY"), os.Getenv("https_proxy"), os.Getenv("HTTP_PROXY"), os.Getenv("http_proxy"))
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	v, err := hostd.ValidateProxy(raw)
+	if err != nil {
+		log.Printf("[hostd] 忽略非法安装代理: %v", err)
+		return ""
+	}
+	return v
 }
 
 func firstNonEmpty(vals ...string) string {

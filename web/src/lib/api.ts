@@ -126,8 +126,8 @@ import type {
 } from "@/lib/types";
 
 function getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("pojun_token");
+  // 浏览器会话走 HttpOnly cookie，不再把 JWT 放进 Authorization 或 localStorage。
+  return null;
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
@@ -141,6 +141,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken();
   const r = await fetch(`/api${path}`, {
     ...init,
+    credentials: "same-origin",
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -151,6 +152,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     if (typeof window !== "undefined") {
       localStorage.removeItem("pojun_token");
       document.cookie = "pojun_token=; path=/; max-age=0";
+      document.cookie = "pojun_session=; path=/; max-age=0";
       window.location.href = "/login";
     }
     throw new Error("未授权");
@@ -190,7 +192,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+// 生产同源 EventSource 会带上 HttpOnly cookie，不再把 token 放进 query。
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# POJUN 渗透测试报告 — Acme Corp
@@ -220,9 +222,7 @@ export function sseUrl(path: string): string {
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
-  const token = getToken();
-  const sep = path.includes("?") ? "&" : "?";
-  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+  return `${base}${path}`;
 }
 
 const get = <T>(p: string) => http<T>(p);
@@ -288,7 +288,8 @@ export const api = {
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
-  initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  initPassword: (password: string, initToken: string) =>
+    post<{ token: string }>("/auth/init", { password, init_token: initToken }),
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 

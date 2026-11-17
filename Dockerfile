@@ -26,6 +26,11 @@ ARG TARGETARCH
 ARG DEBIAN_MIRROR=deb.debian.org
 ARG DEBIAN_SECURITY_MIRROR=deb.debian.org
 ARG NODESOURCE_URL=https://deb.nodesource.com/setup_20.x
+# 不提供摘要就拒绝执行远程安装脚本。摘要必须由构建者自行核对，本文件不内置。
+ARG NODE_SETUP_SHA256=
+ARG NUCLEI_VERSION=
+ARG NUCLEI_SHA256=
+ARG PLAYWRIGHT_VERSION=
 # 注：NodeSource 没有官方镜像替换；受限网络可用 --build-arg NODESOURCE_URL=<可信镜像的 setup 脚本地址>
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
@@ -46,8 +51,17 @@ RUN apt-get update \
          apt-get install -y --no-install-recommends "$pkg" >/dev/null 2>&1 \
          || echo "[warn] apt 包不可用，跳过: $pkg"; \
        done \
-    && curl -fsSL "$NODESOURCE_URL" | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    && if [ -n "${NODE_SETUP_SHA256:-}" ]; then \
+         curl -fsSL "$NODESOURCE_URL" -o /tmp/nodesource-setup.sh \
+         && echo "${NODE_SETUP_SHA256}  /tmp/nodesource-setup.sh" | sha256sum -c - \
+         && bash /tmp/nodesource-setup.sh \
+         && rm -f /tmp/nodesource-setup.sh \
+         && apt-get install -y --no-install-recommends nodejs; \
+       else \
+         echo "[pojun] 未提供 NODE_SETUP_SHA256，不执行 NodeSource 安装脚本，改用发行版 nodejs"; \
+         apt-get install -y --no-install-recommends nodejs \
+         || echo "[warn] 发行版 nodejs 不可用"; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 # kerbrute/waybackurls（上游无 arm64 资产，builder 现场编译）
 COPY --from=gobuild /go/bin/kerbrute /usr/local/bin/kerbrute
@@ -55,32 +69,35 @@ COPY --from=gobuild /go/bin/waybackurls /usr/local/bin/waybackurls
 # nuclei(漏洞模板扫描引擎,配合 /app/nuclei-templates 情报模板库):
 # 官方 release 单二进制按架构下载,模板树由 pojun 的 vulnintel 同步器维护
 # (git clone --depth 1 到 /app/nuclei-templates,每轮同步 git pull 更新)。
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-      amd64) nuclei_arch="linux_amd64" ;; \
-      arm64) nuclei_arch="linux_arm64" ;; \
-      *) echo "unsupported arch: $arch"; exit 1 ;; \
-    esac; \
-    # 版本解析双通道：GitHub API 对 CI runner 共享 IP 经常 403 限流（实测
-    # 2026-11-05 v0.4.54 构建挂在这），后备走 releases/latest 的 302 Location
-    # ——浏览器同款路径，不吃 API 配额。api github 域名也要加超时防挂死。
-    nuclei_ver="$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | jq -r .tag_name)" || nuclei_ver=""; \
-    [ -n "$nuclei_ver" ] && [ "$nuclei_ver" != "null" ] || \
-      nuclei_ver="$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' https://github.com/projectdiscovery/nuclei/releases/latest | sed 's|.*/tag/||')"; \
-    [ -n "$nuclei_ver" ] || { echo "cannot resolve nuclei version"; exit 1; }; \
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "https://github.com/projectdiscovery/nuclei/releases/download/${nuclei_ver}/nuclei_${nuclei_ver#v}_${nuclei_arch}.zip" -o /tmp/nuclei.zip; \
-    unzip -o /tmp/nuclei.zip -d /tmp/nuclei && install -m 0755 /tmp/nuclei/nuclei /usr/local/bin/nuclei \
-    && nuclei -version && rm -rf /tmp/nuclei /tmp/nuclei.zip
+RUN set -eu; \
+    if [ -z "${NUCLEI_VERSION:-}" ] || [ -z "${NUCLEI_SHA256:-}" ]; then \
+      echo "[pojun] 未同时提供 NUCLEI_VERSION 与 NUCLEI_SHA256，跳过 nuclei 下载（不取 latest、不编造摘要）"; \
+    else \
+      arch="$(dpkg --print-architecture)"; \
+      case "$arch" in \
+        amd64) nuclei_arch="linux_amd64" ;; \
+        arm64) nuclei_arch="linux_arm64" ;; \
+        *) echo "unsupported arch: $arch"; exit 1 ;; \
+      esac; \
+      nuclei_ver="${NUCLEI_VERSION}"; \
+      curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "https://github.com/projectdiscovery/nuclei/releases/download/${nuclei_ver}/nuclei_${nuclei_ver#v}_${nuclei_arch}.zip" -o /tmp/nuclei.zip; \
+      echo "${NUCLEI_SHA256}  /tmp/nuclei.zip" | sha256sum -c -; \
+      unzip -o /tmp/nuclei.zip -d /tmp/nuclei && install -m 0755 /tmp/nuclei/nuclei /usr/local/bin/nuclei \
+      && nuclei -version && rm -rf /tmp/nuclei /tmp/nuclei.zip; \
+    fi
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
 # @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
 # 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
 # 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
-RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
-    && playwright-cli --help \
-    && playwright install --with-deps chromium \
-    && rm -rf /var/lib/apt/lists/*
+RUN if [ -n "${PLAYWRIGHT_VERSION:-}" ]; then \
+      npm install -g "@playwright/mcp@${PLAYWRIGHT_VERSION}" "@playwright/cli@${PLAYWRIGHT_VERSION}" "playwright@${PLAYWRIGHT_VERSION}" \
+      && playwright-cli --help \
+      && playwright install --with-deps chromium \
+      && rm -rf /var/lib/apt/lists/*; \
+    else \
+      echo "[pojun] 未提供 PLAYWRIGHT_VERSION，跳过 @latest 的 Playwright 安装"; \
+    fi
 WORKDIR /app
 # 预编译好的对应架构二进制（dist/amd64/pojun 或 dist/arm64/pojun）
 COPY dist/${TARGETARCH}/pojun /app/pojun
@@ -106,9 +123,9 @@ COPY mcp-servers/ /app/mcp-servers/
 RUN python3 -m pip install --no-cache-dir --quiet uv && uv --version
 RUN bash /tmp/install-tools.sh && rm -f /tmp/install-tools.sh
 # 注：catalog 全量 90 项的补齐**不在构建期做**（会把镜像再撑大 1–2GB、构建时间翻倍）。
-# 改为容器首次启动时后台预装（见 docker/docker-entrypoint.sh）：主服务不被阻塞，
-# 安装日志在 data/tools-preinstall.log，「宿主环境」页实时反映进度。
-# 已装的会跳过（幂等）；要禁用后台预装：environment: POJUN_PREINSTALL_TOOLS=0。
+# 容器默认不再后台预装（POJUN_PREINSTALL_TOOLS 默认 0）。要启用必须显式设为 1，
+# 且未校验的 GitHub/pip/script 配方还要 POJUN_HOSTD_ALLOW_UNVERIFIED=1。
+# 安装日志在 data/tools-preinstall.log。该开关不表示文件已经过完整性校验。
 # entrypoint：先后台拉起 hostd（root 常驻，「宿主环境」页一键装工具），再 exec start.sh
 COPY docker/docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh

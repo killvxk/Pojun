@@ -23,7 +23,7 @@ services:
   pojun:
     # 镜像在 GHCR 与 Docker Hub 双源发布；默认走 GHCR（发布工作流必然推送），
     # 需要换源时用 POJUN_IMAGE 覆盖。
-    image: ${POJUN_IMAGE:-ghcr.io/chu0119/pojun}:${POJUN_TAG:-latest}
+    image: ${POJUN_IMAGE:-ghcr.io/chu0119/pojun}:${POJUN_TAG:?请设置 POJUN_TAG 为已核对的版本，不要使用 latest}
     depends_on:
       postgres:
         condition: service_healthy
@@ -36,7 +36,7 @@ services:
       POJUN_LLM_BASE_URL: ${POJUN_LLM_BASE_URL:-}
       POJUN_LLM_PROXY: ${POJUN_LLM_PROXY:-}
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
       - "127.0.0.1:8788:8788"
       # 回连端口映射(按需放开):容器内 MSF/listener 监听的端口要映射到宿主,
       # agent 才能收到 reverse shell。示例(解除注释并按需改):

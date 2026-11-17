@@ -26,6 +26,11 @@ fetch(){
   return 1
 }
 
+if [ "${POJUN_ALLOW_UNVERIFIED_TOOLS:-}" != "1" ]; then
+  warn "未设置 POJUN_ALLOW_UNVERIFIED_TOOLS=1，跳过未钉版本、未校验摘要的 GitHub/pip 下载。该开关不表示文件已校验。"
+  exit 0
+fi
+
 arch="$(dpkg --print-architecture)"
 case "$arch" in
   amd64) pa="amd64"  p2="x86_64"  p3="x86" p4="x64" lin="x86_64" ;;

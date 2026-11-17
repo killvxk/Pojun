@@ -113,6 +113,16 @@ type Server struct {
 	Version  string
 	SelfPath string
 
+	// RequirePeer 为真时，每个请求都要带上可核验的 unix 对端进程。
+	// AllowedExe 是唯一允许的 pojun 主程序绝对路径。同 UID 的 bash 读不到、
+	// 也不使用共享 token；对端可执行文件路径不对就拒绝。这不能挡住「直接执行
+	// 这份已允许的 pojun 二进制」或 ptrace，调用方不得把这一点说成已解决。
+	RequirePeer    bool
+	AllowedExe     string
+	AllowedPIDFile string
+	// Proxy 是进程启动时配置的安装代理。请求体里的 proxy 一律忽略。
+	Proxy string
+
 	upgrading atomic.Bool
 }
 
@@ -148,6 +158,9 @@ func (s *Server) Start(parent context.Context, toolID, proxy string) (*Job, erro
 	}
 	if tool.Kind == hosttools.KindManual {
 		return nil, fmt.Errorf("%s 官方只提供交互式安装器,不支持一键安装", tool.Name)
+	}
+	if unverifiedKind(tool.Kind) && !allowUnverifiedInstall() {
+		return nil, fmt.Errorf("%s 的安装配方没有钉住的版本和摘要，已拒绝。确认上游风险后把 POJUN_HOSTD_ALLOW_UNVERIFIED=1 设到 hostd 进程环境才会放行；该开关不增加完整性校验", tool.Name)
 	}
 	cleanProxy, err := ValidateProxy(proxy)
 	if err != nil {
@@ -715,7 +728,14 @@ func (s *Server) Handler() http.Handler {
 			writeJSON(w, 400, map[string]any{"error": "版本号格式非法: " + req.Tag})
 			return
 		}
-		cleanProxy, err := ValidateProxy(req.Proxy)
+		if err := s.rejectDowngrade(req.Tag); err != nil {
+			writeJSON(w, 400, map[string]any{"error": err.Error()})
+			return
+		}
+		if strings.TrimSpace(req.Proxy) != "" && strings.TrimSpace(req.Proxy) != strings.TrimSpace(s.Proxy) {
+			s.logger.Printf("[hostd] 忽略请求里的 proxy，自我换装只使用进程配置的代理")
+		}
+		cleanProxy, err := ValidateProxy(s.Proxy)
 		if err != nil {
 			writeJSON(w, 400, map[string]any{"error": err.Error()})
 			return
@@ -752,7 +772,10 @@ func (s *Server) Handler() http.Handler {
 			writeJSON(w, 400, map[string]any{"error": "请求体不是合法 JSON"})
 			return
 		}
-		job, err := s.Start(s.base, req.ToolID, req.Proxy)
+		if strings.TrimSpace(req.Proxy) != "" && strings.TrimSpace(req.Proxy) != strings.TrimSpace(s.Proxy) {
+			s.logger.Printf("[hostd] 忽略请求里的 proxy，安装只使用进程配置的代理")
+		}
+		job, err := s.Start(s.base, req.ToolID, s.Proxy)
 		if err != nil {
 			writeJSON(w, 400, map[string]any{"error": err.Error()})
 			return
@@ -777,7 +800,26 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := s.authorizePeer(r); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+func unverifiedKind(kind hosttools.Kind) bool {
+	switch kind {
+	case hosttools.KindGitHub, hosttools.KindPip, hosttools.KindScript:
+		return true
+	default:
+		return false
+	}
+}
+
+func allowUnverifiedInstall() bool {
+	return os.Getenv("POJUN_HOSTD_ALLOW_UNVERIFIED") == "1"
 }
 
 // Listen 建立 Unix socket 并设置权限(仅属主/属组可读写,杜绝本机其它用户触发安装)。

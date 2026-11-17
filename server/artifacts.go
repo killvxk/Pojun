@@ -83,6 +83,73 @@ func artifactKindByExt(name string) (kind, mime string) {
 	return "other", "application/octet-stream"
 }
 
+// sniffedRasterMIME 只承认四种栅格图片的文件头。不使用 kind、登记时的 MIME
+// 或浏览器的内容嗅探。
+func sniffedRasterMIME(head []byte) string {
+	if len(head) >= 8 && bytes.Equal(head[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return "image/png"
+	}
+	if len(head) >= 3 && head[0] == 0xff && head[1] == 0xd8 && head[2] == 0xff {
+		return "image/jpeg"
+	}
+	if len(head) >= 6 && (bytes.Equal(head[:6], []byte("GIF87a")) || bytes.Equal(head[:6], []byte("GIF89a"))) {
+		return "image/gif"
+	}
+	if len(head) >= 12 && bytes.Equal(head[:4], []byte("RIFF")) && bytes.Equal(head[8:12], []byte("WEBP")) {
+		return "image/webp"
+	}
+	return ""
+}
+
+func extRasterMIME(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return ""
+	}
+}
+
+// artifactInlineMIME 仅当扩展名与文件头一致时允许 inline。kind 与库里的 MIME
+// 不参与判断，避免把 HTML 标成 image 后以 text/html 同源执行。
+func artifactInlineMIME(name string, head []byte) (string, bool) {
+	sniffed := sniffedRasterMIME(head)
+	ext := extRasterMIME(name)
+	if sniffed == "" || ext == "" || sniffed != ext {
+		return "", false
+	}
+	return sniffed, true
+}
+
+func readFileHead(path string, n int) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	k, err := f.Read(buf)
+	if k <= 0 || (err != nil && err != io.EOF) {
+		if k <= 0 {
+			return nil
+		}
+	}
+	return buf[:k]
+}
+
+const artifactSandboxCSP = "sandbox; default-src 'none'"
+
+func setArtifactSafetyHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy", artifactSandboxCSP)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
 // sanitizeArtifactName 去掉路径分隔符与控制字符，限制长度。
 func sanitizeArtifactName(name string) string {
 	name = strings.ReplaceAll(name, "\\", "_")
@@ -253,32 +320,39 @@ func (s *Server) serveTaskArtifact(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "attachment file missing")
 		return
 	}
-	// MIME 可能为空（历史登记/扫描补登记），此时按 kind 判断——否则图片会被
-	// 当成普通文件走 attachment，浏览器直接报错（v0.4.16 修复）。
-	isImage := a.Kind == "image" || strings.HasPrefix(strings.ToLower(a.Mime), "image/")
+	// inline 只接受扩展名与文件头一致的栅格图。kind、历史 MIME 都不可信。
+	inlineMIME, inline := artifactInlineMIME(a.Name, readFileHead(abs, 32))
 	q := r.URL.Query()
+	setArtifactSafetyHeaders(w)
 	switch {
-	case isImage && q.Get("thumb") != "":
+	case inline && q.Get("thumb") != "":
 		thumb := abs + ".thumb.jpg"
 		if _, err := os.Stat(thumb); err != nil {
 			if err := writeThumbnail(abs, thumb, 480); err != nil {
-				// 缩略图生成失败退回原图，至少能显示。
-				w.Header().Set("Content-Type", a.Mime)
+				w.Header().Set("Content-Type", inlineMIME)
+				w.Header().Set("Content-Disposition", "inline")
 				w.Header().Set("Cache-Control", "private, max-age=300")
 				http.ServeFile(w, r, abs)
 				return
 			}
 		}
+		if sniffedRasterMIME(readFileHead(thumb, 32)) != "image/jpeg" {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Disposition", attachmentDisposition(sanitizeArtifactName(a.Name)+".thumb"))
+			http.ServeFile(w, r, thumb)
+			return
+		}
 		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Content-Disposition", "inline")
 		w.Header().Set("Cache-Control", "private, max-age=3600")
 		http.ServeFile(w, r, thumb)
-	case isImage && q.Get("download") == "":
-		w.Header().Set("Content-Type", a.Mime)
+	case inline && q.Get("download") == "":
+		w.Header().Set("Content-Type", inlineMIME)
 		w.Header().Set("Content-Disposition", "inline")
 		w.Header().Set("Cache-Control", "private, max-age=600")
 		http.ServeFile(w, r, abs)
 	default:
-		w.Header().Set("Content-Type", a.Mime)
+		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", attachmentDisposition(sanitizeArtifactName(a.Name)))
 		http.ServeFile(w, r, abs)
 	}
@@ -290,13 +364,17 @@ func (s *Server) serveTaskArtifact(w http.ResponseWriter, r *http.Request) {
 // ImageMagick 不可用或失败时回退到纯 Go 实现。
 func writeThumbnail(src, dst string, maxEdge int) error {
 	if bin := findImageMagick(); bin != "" {
+		input, ok := magickInput(src)
+		if !ok {
+			return writeThumbnailGo(src, dst, maxEdge)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, bin, src,
+		cmd := exec.CommandContext(ctx, bin, input,
 			"-auto-orient",
 			"-resize", fmt.Sprintf("%dx%d>", maxEdge, maxEdge),
 			"-quality", "82",
-			dst)
+			"jpeg:"+dst)
 		if err := cmd.Run(); err == nil {
 			if st, err := os.Stat(dst); err == nil && st.Size() > 0 {
 				return nil
@@ -305,6 +383,26 @@ func writeThumbnail(src, dst string, maxEdge int) error {
 		_ = os.Remove(dst)
 	}
 	return writeThumbnailGo(src, dst, maxEdge)
+}
+
+// magickInput 只允许与扩展名一致的栅格图，并强制 ImageMagick 使用对应解码器。
+func magickInput(src string) (string, bool) {
+	mime, ok := artifactInlineMIME(src, readFileHead(src, 32))
+	if !ok {
+		return "", false
+	}
+	switch mime {
+	case "image/png":
+		return "png:" + src, true
+	case "image/jpeg":
+		return "jpeg:" + src, true
+	case "image/gif":
+		return "gif:" + src, true
+	case "image/webp":
+		return "webp:" + src, true
+	default:
+		return "", false
+	}
 }
 
 // findImageMagick 返回可用的 ImageMagick 命令路径（空 = 不可用）。

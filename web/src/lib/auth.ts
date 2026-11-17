@@ -1,5 +1,6 @@
 const TOKEN_KEY = "pojun_token";
-const COOKIE_MAX_AGE = 7 * 24 * 60 * 60; // 7 天（秒）
+const SESSION_FLAG = "pojun_session";
+const COOKIE_MAX_AGE = 24 * 60 * 60; // 与服务端 jwtTTL 一致（秒）
 
 export interface CurrentUser {
   id: string;
@@ -10,37 +11,36 @@ export interface CurrentUser {
   role: string;
 }
 
+function hasSessionFlag(): boolean {
+  if (typeof document === "undefined") return false;
+  return document.cookie.split(";").some((part) => part.trim().startsWith(`${SESSION_FLAG}=1`));
+}
+
 export const auth = {
+  // 不再从 localStorage 读取 JWT。登录态只看服务端下发的非敏感标记；
+  // 真正的 token 在 HttpOnly cookie 里，脚本读不到。
   getToken(): string | null {
     if (typeof window === "undefined") return null;
-    // Mock demo：无真实登录，返回一个假 token 让路由守卫放行、直接进主界面。
-    return localStorage.getItem(TOKEN_KEY) ?? (process.env.NEXT_PUBLIC_MOCK === "1" ? "mock-demo" : null);
+    if (process.env.NEXT_PUBLIC_MOCK === "1") return "mock-demo";
+    return hasSessionFlag() ? "cookie-session" : null;
   },
 
-  setToken(token: string): void {
-    localStorage.setItem(TOKEN_KEY, token);
-    // 同步写 cookie，供 Next.js middleware 服务端读取
-    document.cookie = `${TOKEN_KEY}=${encodeURIComponent(token)}; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Lax`;
+  setToken(_token: string): void {
+    localStorage.removeItem(TOKEN_KEY);
+    document.cookie = `${SESSION_FLAG}=1; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Strict`;
   },
 
   clearToken(): void {
     localStorage.removeItem(TOKEN_KEY);
     document.cookie = `${TOKEN_KEY}=; path=/; max-age=0`;
+    document.cookie = `${SESSION_FLAG}=; path=/; max-age=0`;
+    if (process.env.NEXT_PUBLIC_MOCK === "1") return;
+    void fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }).catch(() => undefined);
   },
 
-  // 从 JWT payload 的 sub 字段解析当前用户，仅用于展示，不做签名验证。
+  // 展示用。JWT 不再放在脚本可读的位置，登录名固定为平台唯一账户。
   getCurrentUser(): CurrentUser | null {
-    const token = this.getToken();
-    if (!token) return null;
-    try {
-      const parts = token.split(".");
-      if (parts.length !== 3) return null;
-      // base64url → base64
-      const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-      const username: string = payload.sub ?? "POJUN";
-      return { id: "1", name: username, username, email: "", avatar: "", role: "operator" };
-    } catch {
-      return null;
-    }
+    if (!this.getToken()) return null;
+    return { id: "1", name: "POJUN", username: "POJUN", email: "", avatar: "", role: "operator" };
   },
 };

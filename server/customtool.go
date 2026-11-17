@@ -17,9 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chu0119/pojun/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/chu0119/pojun/db"
+	"github.com/chu0119/pojun/intercept"
 )
 
 // 本文件实现自定义工具执行器(docs/自定义工具设计.md)。system=false 的 tools 行按
@@ -273,6 +274,9 @@ func (s *Server) buildCustomTool(t *db.Tool) actool.CoreTool {
 		if params == nil {
 			params = map[string]any{}
 		}
+		if err := rejectUnknownParams(schema, params); err != nil {
+			return actool.Errorf(err.Error()), nil
+		}
 		switch kind {
 		case "command":
 			return s.runCommandTool(ctx, execRaw, params, tc)
@@ -335,6 +339,9 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 		return actool.Errorf("command 为空"), nil
 	}
 	cmd := renderTemplate(spec.Command, params, shellQuote)
+	if err := s.enforceRenderedBash(ctx, cmd); err != nil {
+		return actool.Errorf(err.Error()), nil
+	}
 	// 复用 Bash 也在用的底层 run(经 Bash CoreTool.Call):自动继承安全 floor/超时/
 	// 代理 env/输出溢出。工具与 Bash 平级、共用底层,不经过 Bash 这个工具让模型调。
 	bashIn, _ := json.Marshal(map[string]any{"command": cmd})
@@ -493,13 +500,116 @@ func identity(s string) string { return s }
 // shellQuote single-quotes a value for safe shell interpolation.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// renderTemplate replaces {name} placeholders with each param's rendered value.
-func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
-	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
+// rejectUnknownParams 拒绝 schema 没有声明的参数名。多出来的键不能参与替换。
+func rejectUnknownParams(schema map[string]any, params map[string]any) error {
+	props, _ := schema["properties"].(map[string]any)
+	if len(props) == 0 {
+		return nil
 	}
-	return out
+	for k := range params {
+		if _, ok := props[k]; !ok {
+			return fmt.Errorf("参数 %q 不在工具 schema 中", k)
+		}
+	}
+	return nil
+}
+
+func placeholderKey(k string) bool {
+	if k == "" {
+		return false
+	}
+	for _, r := range k {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// renderTemplate 一次扫描占位符。已经写入的参数值不再参加下一轮替换，
+// 因此值里面的 `{其他参数}` 不会把外层引号拆开。
+func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
+	var b strings.Builder
+	b.Grow(len(tmpl))
+	for i := 0; i < len(tmpl); {
+		if tmpl[i] == '{' {
+			if j := strings.IndexByte(tmpl[i+1:], '}'); j >= 0 {
+				key := tmpl[i+1 : i+1+j]
+				if v, ok := params[key]; ok && placeholderKey(key) {
+					b.WriteString(quote(valToStr(v)))
+					i += j + 2
+					continue
+				}
+			}
+		}
+		b.WriteByte(tmpl[i])
+		i++
+	}
+	return b.String()
+}
+
+// enforceRenderedBash 让 command 型自定义工具的最终命令走 Bash 的拦截规则与审计。
+// 工具名不在默认白名单里时，Guard 会直接放行；这里在执行前按渲染结果再判一次。
+func (s *Server) enforceRenderedBash(ctx context.Context, command string) error {
+	if s == nil || s.m == nil || s.m.interceptor == nil {
+		return nil
+	}
+	ic := s.m.interceptor
+	input, err := json.Marshal(map[string]string{"command": command})
+	if err != nil {
+		return fmt.Errorf("无法编码命令以供拦截: %w", err)
+	}
+	const toolName = "Bash"
+	if !ic.IsToolEnabled(toolName) {
+		ic.Log(ctx, intercept.ConvIDFromContext(ctx), intercept.Decision{
+			Action: "allow", Message: "Bash 未纳入拦截启用集，仅记录渲染后的命令",
+		}, toolName, input, "allowed")
+		return nil
+	}
+	dec, matched := ic.Match(toolName, input)
+	if !matched {
+		d, judged := ic.Judge(ctx, toolName, input)
+		if !judged {
+			ic.Log(ctx, intercept.ConvIDFromContext(ctx), intercept.Decision{
+				Action: "allow", Message: "command 自定义工具无规则命中",
+			}, toolName, input, "allowed")
+			return nil
+		}
+		dec = d
+	} else if dec.Action == "judge" {
+		ruleID := dec.RuleID
+		rt := intercept.RuleTimeout{}
+		if dec.TimeoutEnabled {
+			rt = intercept.RuleTimeout{Enabled: true, Seconds: dec.TimeoutSeconds, Action: dec.TimeoutAction}
+		}
+		d, judged := ic.JudgeRuleWithTimeout(ctx, toolName, input, rt)
+		if !judged {
+			ic.Log(ctx, intercept.ConvIDFromContext(ctx), intercept.Decision{
+				Action: "allow", RuleID: ruleID, Message: "研判未给出结论",
+			}, toolName, input, "allowed")
+			return nil
+		}
+		d.RuleID = ruleID
+		dec = d
+	}
+	switch dec.Action {
+	case "deny":
+		ic.Log(ctx, intercept.ConvIDFromContext(ctx), dec, toolName, input, "denied")
+		if dec.Message == "" {
+			return fmt.Errorf("拦截规则拒绝执行该命令")
+		}
+		return fmt.Errorf("%s", dec.Message)
+	case "ask":
+		if !ic.HandleAsk(ctx, intercept.ConvIDFromContext(ctx), dec, toolName, input) {
+			return fmt.Errorf("人工审批未通过")
+		}
+		return nil
+	default:
+		ic.Log(ctx, intercept.ConvIDFromContext(ctx), dec, toolName, input, "allowed")
+		return nil
+	}
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.

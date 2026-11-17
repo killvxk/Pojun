@@ -14,6 +14,23 @@ import (
 // 与「按版本号取 Release」的逻辑待在一起，避免两处规则漂移。
 func ValidVersionTag(tag string) bool { return selfupdate.ValidVersionTag(tag) }
 
+// rejectDowngrade 拒绝把已发布的助手换到更低版本。当前版本不是纯三段式
+// （例如 dev）时无法比较，保持原来的「只接受格式合法的 tag」行为。
+func (s *Server) rejectDowngrade(tag string) error {
+	cur := strings.TrimSpace(s.Version)
+	if cur == "" || cur == "dev" {
+		return nil
+	}
+	cmp, ok := selfupdate.CompareVersions(tag, cur)
+	if !ok {
+		return fmt.Errorf("当前版本 %q 与目标 %q 不能比较，拒绝换装", cur, tag)
+	}
+	if cmp < 0 {
+		return fmt.Errorf("拒绝降级：当前 %s，目标 %s", cur, tag)
+	}
+	return nil
+}
+
 // UpgradeSelf 把助手自己换装到指定 Release 版本。
 //
 // 为什么必须由助手自己做：它装在 root 拥有的 /usr/local/bin，而主服务受
@@ -27,6 +44,9 @@ func (s *Server) UpgradeSelf(ctx context.Context, tag, proxy string) error {
 	tag = strings.TrimSpace(tag)
 	if !ValidVersionTag(tag) {
 		return fmt.Errorf("版本号格式非法: %q", tag)
+	}
+	if err := s.rejectDowngrade(tag); err != nil {
+		return err
 	}
 	if s.SelfPath == "" {
 		return fmt.Errorf("未知自身路径，无法换装")

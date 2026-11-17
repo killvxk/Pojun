@@ -182,6 +182,13 @@ func (s *Server) serveArtifactPreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "preview file missing")
 		return
 	}
+	setArtifactSafetyHeaders(w)
+	if sniffedRasterMIME(readFileHead(file, 32)) != "image/jpeg" {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", attachmentDisposition(fmt.Sprintf("preview-%d.bin", page)))
+		http.ServeFile(w, r, file)
+		return
+	}
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Content-Disposition", "inline")
 	w.Header().Set("Cache-Control", "private, max-age=3600")

@@ -47,10 +47,12 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
-	skillDir string       // root directory for skill subdirectories
-	keyDir   string       // directory holding jwt.key (next to the executable)
-	dataDir  string       // browsable workspace root
-	jwtKey   atomic.Value // HS256 signing key ([]byte); replaceable to revoke sessions
+	skillDir  string       // root directory for skill subdirectories
+	keyDir    string       // directory holding jwt.key (next to the executable)
+	dataDir   string       // browsable workspace root
+	jwtKey    atomic.Value // HS256 signing key ([]byte); replaceable to revoke sessions
+	initMu    sync.Mutex
+	initToken string // 未初始化时的一次性口令；已初始化或使用后为空
 
 	// 文档预览（v0.4.21）：Office/PDF 取样转图片，单 worker 串行（LibreOffice
 	// 的 UserInstallation 不能并发），queue 只放 artifact id。
@@ -289,6 +291,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 主服务写不进去，只能由它自己换装——这里只负责发现版本不一致并通知。
 	s.StartHostdReconcile()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.prepareInitToken()
 	return s
 }
 
@@ -706,6 +709,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
+	mux.HandleFunc("POST /api/auth/logout", s.authLogout)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
 
 	mux.HandleFunc("GET /api/health", s.health)

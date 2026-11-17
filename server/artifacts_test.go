@@ -11,6 +11,38 @@ import (
 	"testing"
 )
 
+func TestArtifactInlineRequiresMatchingRaster(t *testing.T) {
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0}
+	html := []byte("<html><script>alert(1)</script></html>")
+	if _, ok := artifactInlineMIME("x.html", html); ok {
+		t.Fatal("html must not be inlined")
+	}
+	if _, ok := artifactInlineMIME("x.html", png); ok {
+		t.Fatal("png bytes with html extension must not be inlined")
+	}
+	if _, ok := artifactInlineMIME("x.png", html); ok {
+		t.Fatal("html bytes with png extension must not be inlined")
+	}
+	mime, ok := artifactInlineMIME("x.png", png)
+	if !ok || mime != "image/png" {
+		t.Fatalf("real png = %q %v", mime, ok)
+	}
+}
+
+func TestValidateSSHTarget(t *testing.T) {
+	if err := validateSSHTarget("edge@relay.example", "22"); err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"-oProxyCommand=id@host", "user@host;id", "user@host name"} {
+		if err := validateSSHTarget(host, "22"); err == nil {
+			t.Fatalf("accepted %q", host)
+		}
+	}
+	if err := validateSSHTarget("edge@relay.example", "abc"); err == nil {
+		t.Fatal("non-numeric port accepted")
+	}
+}
+
 // TestArtifactKindDocument v0.4.21：Office/PDF 归入可预览类型。
 func TestArtifactKindDocument(t *testing.T) {
 	cases := map[string]string{

@@ -8,9 +8,10 @@
 #     再撑大 1–2GB；装完写标记文件，重启不重复；
 #   - 「系统 → 宿主环境」页可随时查看/补装（走常驻 hostd）。
 # 环境变量：
-#   POJUN_PREINSTALL_TOOLS=0   关闭首次启动预装
-#   POJUN_PREINSTALL_TOOLS=1   默认：首次启动后台预装
-#   POJUN_PREINSTALL_TOOLS=force  强制重跑（升级 binary 后想重新核对工具时用）
+#   POJUN_PREINSTALL_TOOLS=0   默认：不在启动时拉取未校验的上游工具
+#   POJUN_PREINSTALL_TOOLS=1   后台预装。GitHub/pip/script 配方还要另设
+#                              POJUN_HOSTD_ALLOW_UNVERIFIED=1 才会执行，该开关不提供校验
+#   POJUN_PREINSTALL_TOOLS=force  强制重跑（同上，不自动打开未校验安装）
 set -u
 
 HOSTD_SOCK="/run/pojun/hostd.sock"
@@ -24,7 +25,7 @@ mkdir -p "$(dirname "$HOSTD_SOCK")" /app/data
 # ── hostd：常驻 unix socket，供「宿主环境」页一键装/重装 ──
 if [ -x /app/pojun-hostd ]; then
   if [ ! -S "$HOSTD_SOCK" ]; then
-    /app/pojun-hostd -socket "$HOSTD_SOCK" >>/app/data/hostd.log 2>&1 &
+    /app/pojun-hostd -socket "$HOSTD_SOCK" -allow-exe /app/pojun >>/app/data/hostd.log 2>&1 &
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       [ -S "$HOSTD_SOCK" ] && break
       sleep 0.3
@@ -37,7 +38,7 @@ if [ -x /app/pojun-hostd ]; then
   fi
 
   # ── 首次启动后台预装 catalog 全量工具（幂等；失败项可在宿主环境页重试）──
-  mode="${POJUN_PREINSTALL_TOOLS:-1}"
+  mode="${POJUN_PREINSTALL_TOOLS:-0}"
   if [ "$mode" != "0" ]; then
     if [ "$mode" = "force" ] || [ ! -f "$PREINSTALL_MARK" ]; then
       (

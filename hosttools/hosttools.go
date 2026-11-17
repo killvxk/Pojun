@@ -225,10 +225,12 @@ var catalog = []Tool{
 	{Name: "adb", Purpose: "Android 设备直连：安装/拉取/日志/端口转发", Kind: KindApt, Category: CatMobile, Apt: "adb", Dnf: "android-tools"},
 	{Name: "jadx", Purpose: "APK→Java 反编译（接口/密钥/业务逻辑）", Kind: KindScript, Category: CatMobile,
 		Script: `set -e
-curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 https://api.github.com/repos/skylot/jadx/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 > /tmp/jadx.tag
-TAG=$(cat /tmp/jadx.tag); VER=${TAG#v}
-curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o /tmp/jadx.zip "https://github.com/skylot/jadx/releases/download/${TAG}/jadx-${VER}.zip"
-rm -rf /opt/jadx && mkdir -p /opt/jadx && unzip -q -o /tmp/jadx.zip -d /opt/jadx
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/pojun-jadx.XXXXXX")
+trap 'rm -rf "$WORKDIR"' EXIT
+curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 https://api.github.com/repos/skylot/jadx/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 > "$WORKDIR/jadx.tag"
+TAG=$(cat "$WORKDIR/jadx.tag"); VER=${TAG#v}
+curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o "$WORKDIR/jadx.zip" "https://github.com/skylot/jadx/releases/download/${TAG}/jadx-${VER}.zip"
+rm -rf /opt/jadx && mkdir -p /opt/jadx && unzip -q -o "$WORKDIR/jadx.zip" -d /opt/jadx
 ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx
 ln -sf /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui 2>/dev/null || true
 `},
@@ -299,7 +301,9 @@ chmod +x /opt/jwt_tool/jwt_tool.py
 mkdir -p /opt/ysoserial.net
 API=$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 https://api.github.com/repos/pwntester/ysoserial.net/releases/latest)
 URL=$(printf '%s' "$API" | grep -o '"browser_download_url": *"[^"]*\.zip"' | head -1 | cut -d'"' -f4)
-[ -n "$URL" ] && curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o /tmp/ysnet.zip "$URL" && unzip -q -o /tmp/ysnet.zip -d /opt/ysoserial.net
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/pojun-ysnet.XXXXXX")
+trap 'rm -rf "$WORKDIR"' EXIT
+[ -n "$URL" ] && curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o "$WORKDIR/ysnet.zip" "$URL" && unzip -q -o "$WORKDIR/ysnet.zip" -d /opt/ysoserial.net
 `},
 	{Name: "searchsploit", Purpose: "ExploitDB 本地检索(组件/CVE 对应 PoC)", Kind: KindScript, Category: CatExploit,
 		Script: `set -e
@@ -440,9 +444,11 @@ python3 -m pip install --break-system-packages "git+https://github.com/Pennyw0rt
 
 	{Name: "msfconsole", Purpose: "Metasploit 框架(exploit/encoder)", Kind: KindScript, Category: CatExploit,
 		Script: `set -e
-curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o /tmp/msfinstall https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb
-chmod +x /tmp/msfinstall
-/tmp/msfinstall
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/pojun-msf.XXXXXX")
+trap 'rm -rf "$WORKDIR"' EXIT
+curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o "$WORKDIR/msfinstall" https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb
+chmod 0700 "$WORKDIR/msfinstall"
+"$WORKDIR/msfinstall"
 `},
 }
 
